@@ -6,26 +6,19 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Set up JDK 17
         uses: actions/setup-java@v5
         with:
-          java-version: '17'
-          distribution: 'temurin'
+          java-version: "17"
+          distribution: "temurin"
 
-      - name: Generate 3 Core Project Files via Python3
-        shell: python3 {0}
+      - name: Create 3 Core Project Files
         run: |
-          import pathlib
+          mkdir -p app/src/main/java/com/signaturepro/camera
 
-          def write_file(path, content):
-              p = pathlib.Path(path)
-              p.parent.mkdir(parents=True, exist_ok=True)
-              p.write_text(content.strip() + "\n", encoding="utf-8")
-
-          write_file("app/src/main/AndroidManifest.xml", '''
-          <?xml version="1.0" encoding="utf-8"?>
+          echo '<?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android"
               package="com.signaturepro.camera"
               android:versionCode="1"
@@ -57,11 +50,9 @@ jobs:
                       </intent-filter>
                   </activity>
               </application>
-          </manifest>
-          ''')
+          </manifest>' > app/src/main/AndroidManifest.xml
 
-          write_file("app/build.gradle.kts", '''
-          plugins {
+          echo 'plugins {
               id("com.android.application")
           }
 
@@ -76,11 +67,9 @@ jobs:
                   versionCode = 1
                   versionName = "1.0.0-SignaturePro"
               }
-          }
-          ''')
+          }' > app/build.gradle.kts
 
-          write_file("app/src/main/java/com/signaturepro/camera/MainActivity.java", '''
-          package com.signaturepro.camera;
+          echo 'package com.signaturepro.camera;
 
           import android.Manifest;
           import android.app.Activity;
@@ -97,7 +86,6 @@ jobs:
           import android.graphics.Rect;
           import android.graphics.SurfaceTexture;
           import android.graphics.Typeface;
-          import android.graphics.drawable.GradientDrawable;
           import android.hardware.camera2.CameraCaptureSession;
           import android.hardware.camera2.CameraCharacteristics;
           import android.hardware.camera2.CameraDevice;
@@ -106,7 +94,6 @@ jobs:
           import android.hardware.camera2.CaptureRequest;
           import android.hardware.camera2.DngCreator;
           import android.hardware.camera2.TotalCaptureResult;
-          import android.hardware.camera2.params.DynamicRangeProfiles;
           import android.hardware.camera2.params.OutputConfiguration;
           import android.hardware.camera2.params.RggbChannelVector;
           import android.hardware.camera2.params.SessionConfiguration;
@@ -135,10 +122,10 @@ jobs:
           import android.widget.LinearLayout;
           import android.widget.SeekBar;
           import android.widget.TextView;
-          import android.widget.Toast;
 
           import java.io.File;
           import java.io.OutputStream;
+          import java.lang.reflect.Method;
           import java.nio.ByteBuffer;
           import java.text.SimpleDateFormat;
           import java.util.ArrayList;
@@ -288,19 +275,12 @@ jobs:
                               if (caps != null) {
                                   for (int c : caps) {
                                       if (c == CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_RAW) hasRaw = true;
-                                      if (c == CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_ULTRA_HIGH_RESOLUTION_SENSOR) has50Mp = true;
-                                      if (Build.VERSION.SDK_INT >= 33 && c == CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_DYNAMIC_RANGE_TEN_BIT) has10Bit = true;
+                                      if (c == 16) has50Mp = true;
+                                      if (c == 18) has10Bit = true;
                                   }
                               }
 
-                              StreamConfigurationMap map = null;
-                              if (has50Mp) {
-                                  map = pChars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION);
-                              }
-                              if (map == null) {
-                                  map = pChars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
-                              }
-
+                              StreamConfigurationMap map = pChars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
                               Size maxRaw = null;
                               Size maxJpeg = new Size(4096, 3072);
                               if (map != null) {
@@ -418,4 +398,802 @@ jobs:
                   if (selectedLens.physicalId != null) {
                       cfg.setPhysicalCameraId(selectedLens.physicalId);
                   }
-                  if (try10Bit && selectedLens.supports10Bit && Build.VERSION.SDK_INT >=
+                  if (try10Bit && selectedLens.supports10Bit && Build.VERSION.SDK_INT >= 33) {
+                      try {
+                          Method m = OutputConfiguration.class.getMethod("setDynamicRangeProfile", long.class);
+                          m.invoke(cfg, 2L);
+                      } catch (Exception ignored) {}
+                  }
+                  return cfg;
+              }
+
+              private void configureStreams(CameraDevice device) {
+                  try {
+                      activeSurfaceTexture.setDefaultBufferSize(1920, 1080);
+                      final Surface previewSurface = new Surface(activeSurfaceTexture);
+                      List<OutputConfiguration> outputs = new ArrayList<>();
+
+                      boolean isVideo = (selectedMode == CaptureMode.VIDEO_10BIT_HLG);
+                      outputs.add(wrapOutput(previewSurface, isVideo));
+
+                      analyzerReader = ImageReader.newInstance(640, 480, ImageFormat.YUV_420_888, 2);
+                      analyzerReader.setOnImageAvailableListener(new ImageReader.OnImageAvailableListener() {
+                          @Override
+                          public void onImageAvailable(ImageReader reader) {
+                              Image img = reader.acquireLatestImage();
+                              if (img != null) {
+                                  processLiveTelemetry(img);
+                                  img.close();
+                              }
+                          }
+                      }, cameraHandler);
+                      outputs.add(wrapOutput(analyzerReader.getSurface(), false));
+
+                      if (isVideo) {
+                          setupMediaRecorder();
+                          if (mediaRecorder != null) {
+                              outputs.add(wrapOutput(mediaRecorder.getSurface(), true));
+                          }
+                      } else {
+                          Size jSize = (selectedMode == CaptureMode.TELEMACRO_STACK) ? new Size(1920, 1440) : selectedLens.maxJpegSize;
+                          jpegReader = ImageReader.newInstance(jSize.getWidth(), jSize.getHeight(), ImageFormat.JPEG, 12);
+                          jpegReader.setOnImageAvailableListener(new ImageReader.OnImageAvailableListener() {
+                              @Override
+                              public void onImageAvailable(ImageReader reader) {
+                                  Image img = reader.acquireNextImage();
+                                  if (img != null) handleJpegFrame(img);
+                              }
+                          }, cameraHandler);
+                          outputs.add(wrapOutput(jpegReader.getSurface(), false));
+
+                          if (selectedMode == CaptureMode.PRO_RAW_16 && selectedLens.supportsRaw && selectedLens.maxRawSize != null) {
+                              rawReader = ImageReader.newInstance(
+                                  selectedLens.maxRawSize.getWidth(),
+                                  selectedLens.maxRawSize.getHeight(),
+                                  ImageFormat.RAW_SENSOR, 4
+                              );
+                              outputs.add(wrapOutput(rawReader.getSurface(), false));
+                          }
+                      }
+
+                      SessionConfiguration sessionCfg = new SessionConfiguration(
+                          SessionConfiguration.SESSION_REGULAR,
+                          outputs,
+                          cameraExecutor,
+                          new CameraCaptureSession.StateCallback() {
+                              @Override
+                              public void onConfigured(CameraCaptureSession session) {
+                                  captureSession = session;
+                                  setStatus("Locked: " + selectedLens.label + " | " + selectedMode.title);
+                                  updateRepeatingPreview();
+                              }
+                              @Override
+                              public void onConfigureFailed(CameraCaptureSession session) {
+                                  setStatus("Stream Config Failed");
+                              }
+                          }
+                      );
+                      device.createCaptureSession(sessionCfg);
+                  } catch (Exception e) {
+                      setStatus("Stream Error: " + e.getMessage());
+                  }
+              }
+
+              private void updateRepeatingPreview() {
+                  if (cameraDevice == null || captureSession == null || activeSurfaceTexture == null) return;
+                  try {
+                      int template = (selectedMode == CaptureMode.VIDEO_10BIT_HLG)
+                          ? CameraDevice.TEMPLATE_RECORD : CameraDevice.TEMPLATE_PREVIEW;
+                      CaptureRequest.Builder b = cameraDevice.createCaptureRequest(template);
+                      b.addTarget(new Surface(activeSurfaceTexture));
+                      if (analyzerReader != null) b.addTarget(analyzerReader.getSurface());
+                      if (isRecordingVideo && mediaRecorder != null) b.addTarget(mediaRecorder.getSurface());
+
+                      applyManualProParameters(b, focusDiopters);
+                      captureSession.setRepeatingRequest(b.build(), null, cameraHandler);
+                  } catch (Exception e) {
+                      setStatus("Preview Error: " + e.getMessage());
+                  }
+              }
+
+              private void applyManualProParameters(CaptureRequest.Builder b, float fDist) {
+                  long shutterNs = 1000000000L / Math.max(1, shutterDenom);
+                  b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO);
+                  b.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF);
+                  b.set(CaptureRequest.SENSOR_SENSITIVITY, iso);
+                  b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, shutterNs);
+
+                  if (fDist <= 0.05f) {
+                      b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
+                  } else {
+                      b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF);
+                      b.set(CaptureRequest.LENS_FOCUS_DISTANCE, fDist);
+                  }
+
+                  b.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON);
+                  b.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF);
+
+                  b.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF);
+                  b.set(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX);
+                  float norm = (kelvin - 5500f) / 4500f;
+                  float rG = Math.max(1.0f, Math.min(3.2f, 1.85f + norm * 0.65f));
+                  float bG = Math.max(1.0f, Math.min(3.2f, 1.85f - norm * 0.65f));
+                  b.set(CaptureRequest.COLOR_CORRECTION_GAINS, new RggbChannelVector(rG, 1.0f, 1.0f, bG));
+
+                  if (selectedLens.isLossless2x) {
+                      Rect r = selectedLens.activeRect;
+                      int cw = r.width() / 2;
+                      int ch = r.height() / 2;
+                      int left = r.left + (r.width() - cw) / 2;
+                      int top = r.top + (r.height() - ch) / 2;
+                      b.set(CaptureRequest.SCALER_CROP_REGION, new Rect(left, top, left + cw, top + ch));
+                  }
+              }
+
+              private void triggerCapture() {
+                  if (cameraDevice == null || captureSession == null) return;
+                  try {
+                      if (selectedMode == CaptureMode.VIDEO_10BIT_HLG) {
+                          toggleVideoRecording();
+                      } else if (selectedMode == CaptureMode.TELEMACRO_STACK) {
+                          expectedBurstCount = 10;
+                          burstBitmaps.clear();
+                          setStatus("Shooting 10-Frame 14cm Telemacro Stack...");
+                          List<CaptureRequest> burst = new ArrayList<>();
+                          float startD = (focusDiopters > 1.0f) ? focusDiopters : 7.14f;
+                          float endD = Math.max(0.5f, startD - 2.6f);
+                          float step = (endD - startD) / 9.0f;
+
+                          for (int i = 0; i < 10; i++) {
+                              CaptureRequest.Builder b = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
+                              if (jpegReader != null) b.addTarget(jpegReader.getSurface());
+                              applyManualProParameters(b, startD + step * i);
+                              burst.add(b.build());
+                          }
+                          captureSession.captureBurst(burst, null, cameraHandler);
+                      } else {
+                          setStatus("Capturing " + selectedMode.title + "...");
+                          CaptureRequest.Builder b = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
+                          if (jpegReader != null) b.addTarget(jpegReader.getSurface());
+                          if (selectedMode == CaptureMode.PRO_RAW_16 && rawReader != null) {
+                              b.addTarget(rawReader.getSurface());
+                          }
+                          b.set(CaptureRequest.EDGE_MODE, CameraMetadata.EDGE_MODE_OFF);
+                          b.set(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_OFF);
+                          b.set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE, CameraMetadata.STATISTICS_LENS_SHADING_MAP_MODE_ON);
+                          b.set(CaptureRequest.HOT_PIXEL_MODE, CameraMetadata.HOT_PIXEL_MODE_HIGH_QUALITY);
+                          applyManualProParameters(b, focusDiopters);
+
+                          captureSession.capture(b.build(), new CameraCaptureSession.CaptureCallback() {
+                              @Override
+                              public void onCaptureCompleted(CameraCaptureSession s, CaptureRequest req, TotalCaptureResult res) {
+                                  if (selectedMode == CaptureMode.PRO_RAW_16 && rawReader != null && activeCharacteristics != null) {
+                                      Image rawImg = rawReader.acquireLatestImage();
+                                      if (rawImg != null) saveRawDng(rawImg, activeCharacteristics, res);
+                                  }
+                              }
+                          }, cameraHandler);
+                      }
+                  } catch (Exception e) {
+                      setStatus("Capture Error: " + e.getMessage());
+                  }
+              }
+
+              private void handleJpegFrame(Image img) {
+                  ByteBuffer buf = img.getPlanes()[0].getBuffer();
+                  final byte[] bytes = new byte[buf.remaining()];
+                  buf.get(bytes);
+                  img.close();
+
+                  if (selectedMode == CaptureMode.TELEMACRO_STACK) {
+                      Bitmap bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
+                      if (bmp != null) {
+                          burstBitmaps.add(bmp);
+                          setStatus("Stack Frame " + burstBitmaps.size() + "/" + expectedBurstCount);
+                          if (burstBitmaps.size() >= expectedBurstCount) {
+                              final List<Bitmap> copy = new ArrayList<>(burstBitmaps);
+                              burstBitmaps.clear();
+                              ioExecutor.execute(new Runnable() {
+                                  @Override
+                                  public void run() { mergeFocusStackLaplacian(copy); }
+                              });
+                          }
+                      }
+                  } else {
+                      ioExecutor.execute(new Runnable() {
+                          @Override
+                          public void run() {
+                              String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+                              String name = "SIGPRO_" + selectedMode.name() + "_" + stamp + ".jpg";
+                              saveToMediaStore(bytes, name, "image/jpeg");
+                              setStatus("Saved " + name + " to DCIM/SignaturePro");
+                          }
+                      });
+                  }
+              }
+
+              private void mergeFocusStackLaplacian(List<Bitmap> frames) {
+                  setStatus("Merging 10-Frame Telemacro Focus Stack...");
+                  int w = frames.get(0).getWidth();
+                  int h = frames.get(0).getHeight();
+                  int total = w * h;
+                  int[] bestPixels = new int[total];
+                  int[] bestContrast = new int[total];
+                  for (int i = 0; i < total; i++) bestContrast[i] = -1;
+                  int[] rowBuf = new int[total];
+
+                  for (Bitmap frame : frames) {
+                      frame.getPixels(rowBuf, 0, w, 0, 0, w, h);
+                      for (int y = 1; y < h - 1; y++) {
+                          int rowOff = y * w;
+                          for (int x = 1; x < w - 1; x++) {
+                              int idx = rowOff + x;
+                              int c = luma(rowBuf[idx]);
+                              int l = luma(rowBuf[idx - 1]);
+                              int r = luma(rowBuf[idx + 1]);
+                              int u = luma(rowBuf[idx - w]);
+                              int d = luma(rowBuf[idx + w]);
+                              int energy = Math.abs(4 * c - l - r - u - d);
+                              if (energy > bestContrast[idx]) {
+                                  bestContrast[idx] = energy;
+                                  bestPixels[idx] = rowBuf[idx];
+                              }
+                          }
+                      }
+                  }
+
+                  Bitmap merged = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+                  merged.setPixels(bestPixels, 0, w, 0, 0, w, h);
+                  String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+                  String name = "SIGPRO_MACRO_STACK10_" + stamp + ".jpg";
+                  try {
+                      ContentResolver resolver = getContentResolver();
+                      ContentValues v = new ContentValues();
+                      v.put(MediaStore.Images.Media.DISPLAY_NAME, name);
+                      v.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
+                      v.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_DCIM + "/SignaturePro");
+                      Uri uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v);
+                      if (uri != null) {
+                          OutputStream out = resolver.openOutputStream(uri);
+                          if (out != null) {
+                              merged.compress(Bitmap.CompressFormat.JPEG, 98, out);
+                              out.close();
+                          }
+                      }
+                  } catch (Exception ignored) {}
+                  for (Bitmap b : frames) b.recycle();
+                  merged.recycle();
+                  setStatus("Focus Stack Saved: " + name);
+              }
+
+              private void saveRawDng(final Image rawImg, final CameraCharacteristics chars, final TotalCaptureResult res) {
+                  ioExecutor.execute(new Runnable() {
+                      @Override
+                      public void run() {
+                          try {
+                              String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+                              String name = "SIGPRO_16BIT_" + stamp + ".dng";
+                              ContentResolver resolver = getContentResolver();
+                              ContentValues v = new ContentValues();
+                              v.put(MediaStore.Images.Media.DISPLAY_NAME, name);
+                              v.put(MediaStore.Images.Media.MIME_TYPE, "image/x-adobe-dng");
+                              v.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_DCIM + "/SignaturePro");
+                              Uri uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v);
+                              if (uri != null) {
+                                  OutputStream out = resolver.openOutputStream(uri);
+                                  if (out != null) {
+                                      DngCreator dng = new DngCreator(chars, res);
+                                      dng.writeImage(out, rawImg);
+                                      dng.close();
+                                      out.close();
+                                  }
+                              }
+                              setStatus("Saved 16-Bit RAW: " + name);
+                          } catch (Exception e) {
+                              setStatus("DNG Error: " + e.getMessage());
+                          } finally {
+                              rawImg.close();
+                          }
+                      }
+                  });
+              }
+
+              private void saveToMediaStore(byte[] bytes, String name, String mime) {
+                  try {
+                      ContentResolver resolver = getContentResolver();
+                      ContentValues v = new ContentValues();
+                      v.put(MediaStore.Images.Media.DISPLAY_NAME, name);
+                      v.put(MediaStore.Images.Media.MIME_TYPE, mime);
+                      v.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_DCIM + "/SignaturePro");
+                      Uri uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v);
+                      if (uri != null) {
+                          OutputStream out = resolver.openOutputStream(uri);
+                          if (out != null) {
+                              out.write(bytes);
+                              out.close();
+                          }
+                      }
+                  } catch (Exception ignored) {}
+              }
+
+              private void setupMediaRecorder() {
+                  try {
+                      File dir = new File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), "SignaturePro");
+                      dir.mkdirs();
+                      String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+                      pendingVideoFile = new File(dir, "SIGPRO_4K_HLG10_" + stamp + ".mp4");
+                      mediaRecorder = new MediaRecorder();
+                      mediaRecorder.setAudioSource(MediaRecorder.AudioSource.MIC);
+                      mediaRecorder.setVideoSource(MediaRecorder.VideoSource.SURFACE);
+                      mediaRecorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
+                      mediaRecorder.setOutputFile(pendingVideoFile.getAbsolutePath());
+                      mediaRecorder.setVideoEncodingBitRate(120000000);
+                      mediaRecorder.setVideoFrameRate(60);
+                      mediaRecorder.setVideoSize(3840, 2160);
+                      mediaRecorder.setVideoEncoder(MediaRecorder.VideoEncoder.HEVC);
+                      mediaRecorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
+                      mediaRecorder.setAudioEncodingBitRate(320000);
+                      mediaRecorder.setAudioSamplingRate(48000);
+                      mediaRecorder.prepare();
+                  } catch (Exception e) {
+                      setStatus("Recorder Init Error: " + e.getMessage());
+                  }
+              }
+
+              private void toggleVideoRecording() {
+                  if (!isRecordingVideo) {
+                      try {
+                          isRecordingVideo = true;
+                          updateRepeatingPreview();
+                          mediaRecorder.start();
+                          shutterBtn.setText("STOP");
+                          setStatus("REC 4K 10-Bit HLG (120 Mbps)...");
+                      } catch (Exception e) {
+                          isRecordingVideo = false;
+                          setStatus("Video Start Error: " + e.getMessage());
+                      }
+                  } else {
+                      try {
+                          mediaRecorder.stop();
+                          mediaRecorder.reset();
+                          isRecordingVideo = false;
+                          shutterBtn.setText("REC");
+                          setStatus("Saved Video: " + pendingVideoFile.getName());
+                      } catch (Exception e) {
+                          isRecordingVideo = false;
+                          setStatus("Video Stop Error: " + e.getMessage());
+                      }
+                  }
+              }
+
+              private void processLiveTelemetry(Image img) {
+                  Image.Plane yPlane = img.getPlanes()[0];
+                  ByteBuffer yBuf = yPlane.getBuffer();
+                  int stride = yPlane.getRowStride();
+                  int w = img.getWidth();
+                  int h = img.getHeight();
+
+                  int[] bins = new int[64];
+                  final List< float[] > peaks = new ArrayList<>();
+                  final List< float[] > zebras = new ArrayList<>();
+
+                  int step = 6;
+                  for (int y = step; y < h - step; y += step) {
+                      int row = y * stride;
+                      for (int x = step; x < w - step; x += step) {
+                          int idx = row + x;
+                          int l = yBuf.get(idx) & 0xFF;
+                          bins[l >> 2]++;
+                          if (enableZebras && l >= 242) {
+                              zebras.add(new float[]{x / (float) w, y / (float) h});
+                          }
+                          if (enablePeaking) {
+                              int left = yBuf.get(idx - 2) & 0xFF;
+                              int right = yBuf.get(idx + 2) & 0xFF;
+                              int up = yBuf.get(idx - 2 * stride) & 0xFF;
+                              int down = yBuf.get(idx + 2 * stride) & 0xFF;
+                              int gx = right - left;
+                              int gy = down - up;
+                              if (gx * gx + gy * gy > 3600) {
+                                  peaks.add(new float[]{x / (float) w, y / (float) h});
+                              }
+                          }
+                      }
+                  }
+
+                  int maxBin = 1;
+                  for (int b : bins) if (b > maxBin) maxBin = b;
+                  final float[] normBins = new float[64];
+                  for (int i = 0; i < 64; i++) normBins[i] = bins[i] / (float) maxBin;
+
+                  mainHandler.post(new Runnable() {
+                      @Override
+                      public void run() {
+                          System.arraycopy(normBins, 0, histogramBins, 0, 64);
+                          peakPoints.clear();
+                          peakPoints.addAll(peaks);
+                          zebraPoints.clear();
+                          zebraPoints.addAll(zebras);
+                          if (overlayView != null) overlayView.invalidate();
+                      }
+                  });
+              }
+
+              private int luma(int argb) {
+                  int r = (argb >> 16) & 0xFF;
+                  int g = (argb >> 8) & 0xFF;
+                  int b = argb & 0xFF;
+                  return (r * 77 + g * 150 + b * 29) >> 8;
+              }
+
+              private void setStatus(final String msg) {
+                  mainHandler.post(new Runnable() {
+                      @Override
+                      public void run() {
+                          if (statusText != null) statusText.setText(msg);
+                      }
+                  });
+              }
+
+              private void refreshTelemetryHeader() {
+                  if (telemetryText == null) return;
+                  String focusStr = (focusDiopters <= 0.05f)
+                      ? "AF-C"
+                      : String.format(Locale.US, "%.2fD (%dcm)", focusDiopters, Math.round(100f / focusDiopters));
+                  telemetryText.setText(String.format(Locale.US, "ISO %d  |  1/%ds  |  %s  |  %dK",
+                      iso, shutterDenom, focusStr, kelvin));
+              }
+
+              private class OverlayView extends View {
+                  private final Paint gridPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  private final Paint peakPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  private final Paint zebraPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  private final Paint histBgPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  private final Paint histBarPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+
+                  OverlayView(Context ctx) {
+                      super(ctx);
+                      gridPaint.setColor(Color.argb(55, 255, 255, 255));
+                      gridPaint.setStrokeWidth(2f);
+                      peakPaint.setColor(Color.argb(215, 0, 230, 118));
+                      zebraPaint.setColor(Color.argb(190, 255, 23, 68));
+                      histBgPaint.setColor(Color.argb(170, 0, 0, 0));
+                      histBarPaint.setStrokeWidth(3f);
+                  }
+
+                  @Override
+                  protected void onDraw(Canvas c) {
+                      super.onDraw(c);
+                      float w = getWidth();
+                      float h = getHeight();
+
+                      c.drawLine(w / 3f, 0, w / 3f, h, gridPaint);
+                      c.drawLine(2f * w / 3f, 0, 2f * w / 3f, h, gridPaint);
+                      c.drawLine(0, h / 3f, w, h / 3f, gridPaint);
+                      c.drawLine(0, 2f * h / 3f, w, 2f * h / 3f, gridPaint);
+
+                      if (enableZebras) {
+                          for (float[] pt : zebraPoints) {
+                              c.drawCircle(pt[0] * w, pt[1] * h, 4.5f, zebraPaint);
+                          }
+                      }
+                      if (enablePeaking) {
+                          for (float[] pt : peakPoints) {
+                              c.drawCircle(pt[0] * w, pt[1] * h, 3.5f, peakPaint);
+                          }
+                      }
+
+                      float hw = dp(110);
+                      float hh = dp(48);
+                      float hx = w - hw - dp(12);
+                      float hy = dp(12);
+                      c.drawRect(hx, hy, hx + hw, hy + hh, histBgPaint);
+                      float bw = hw / 64f;
+                      for (int i = 0; i < 64; i++) {
+                          histBarPaint.setColor(i > 58 ? Color.RED : Color.rgb(0, 230, 118));
+                          float bh = histogramBins[i] * (hh - 6f);
+                          c.drawLine(hx + i * bw, hy + hh - 3f, hx + i * bw, hy + hh - 3f - bh, histBarPaint);
+                      }
+                  }
+              }
+
+              private View buildProCinemaUi() {
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setBackgroundColor(Color.rgb(10, 10, 12));
+                  root.setPadding(dp(8), dp(8), dp(8), dp(8));
+
+                  LinearLayout topBar = new LinearLayout(this);
+                  topBar.setOrientation(LinearLayout.VERTICAL);
+                  topBar.setBackgroundColor(Color.rgb(22, 22, 26));
+                  topBar.setPadding(dp(10), dp(8), dp(10), dp(8));
+
+                  statusText = new TextView(this);
+                  statusText.setText("Motorola Signature Hardware Ready");
+                  statusText.setTextColor(Color.rgb(0, 230, 118));
+                  statusText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+                  statusText.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+                  topBar.addView(statusText);
+
+                  telemetryText = new TextView(this);
+                  telemetryText.setTextColor(Color.WHITE);
+                  telemetryText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+                  telemetryText.setTypeface(Typeface.MONOSPACE, Typeface.NORMAL);
+                  topBar.addView(telemetryText);
+
+                  root.addView(topBar, new LinearLayout.LayoutParams(
+                      ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+                  FrameLayout vfContainer = new FrameLayout(this);
+                  TextureView tv = new TextureView(this);
+                  tv.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
+                      @Override
+                      public void onSurfaceTextureAvailable(SurfaceTexture st, int width, int height) {
+                          activeSurfaceTexture = st;
+                          startCameraSession();
+                      }
+                      @Override
+                      public void onSurfaceTextureSizeChanged(SurfaceTexture st, int width, int height) {}
+                      @Override
+                      public boolean onSurfaceTextureDestroyed(SurfaceTexture st) { return true; }
+                      @Override
+                      public void onSurfaceTextureUpdated(SurfaceTexture st) {}
+                  });
+                  vfContainer.addView(tv, new FrameLayout.LayoutParams(
+                      ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+                  overlayView = new OverlayView(this);
+                  vfContainer.addView(overlayView, new FrameLayout.LayoutParams(
+                      ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+                  LinearLayout.LayoutParams vfParams = new LinearLayout.LayoutParams(
+                      ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
+                  vfParams.topMargin = dp(6);
+                  vfParams.bottomMargin = dp(6);
+                  root.addView(vfContainer, vfParams);
+
+                  LinearLayout deck = new LinearLayout(this);
+                  deck.setOrientation(LinearLayout.VERTICAL);
+                  deck.setBackgroundColor(Color.rgb(20, 20, 24));
+                  deck.setPadding(dp(8), dp(8), dp(8), dp(8));
+
+                  LinearLayout lensRow = new LinearLayout(this);
+                  lensRow.setOrientation(LinearLayout.HORIZONTAL);
+                  lensButtons.clear();
+                  for (final LensProfile lp : lenses) {
+                      final Button b = new Button(this);
+                      b.setText(lp.label);
+                      b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+                      b.setAllCaps(false);
+                      b.setOnClickListener(new View.OnClickListener() {
+                          @Override
+                          public void onClick(View v) {
+                              v.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK);
+                              selectedLens = lp;
+                              updateSelectionColors();
+                              startCameraSession();
+                          }
+                      });
+                      lensButtons.add(b);
+                      lensRow.addView(b, new LinearLayout.LayoutParams(0, dp(36), 1f));
+                  }
+                  deck.addView(lensRow);
+
+                  LinearLayout modeRow = new LinearLayout(this);
+                  modeRow.setOrientation(LinearLayout.HORIZONTAL);
+                  modeButtons.clear();
+                  for (final CaptureMode cm : CaptureMode.values()) {
+                      final Button b = new Button(this);
+                      b.setText(cm.title);
+                      b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 9);
+                      b.setAllCaps(false);
+                      b.setOnClickListener(new View.OnClickListener() {
+                          @Override
+                          public void onClick(View v) {
+                              v.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK);
+                              selectedMode = cm;
+                              updateSelectionColors();
+                              startCameraSession();
+                          }
+                      });
+                      modeButtons.add(b);
+                      modeRow.addView(b, new LinearLayout.LayoutParams(0, dp(34), 1f));
+                  }
+                  deck.addView(modeRow);
+
+                  deck.addView(buildSliderRow("ISO", 127, 3, new SeekBar.OnSeekBarChangeListener() {
+                      @Override
+                      public void onProgressChanged(SeekBar sb, int p, boolean fromUser) {
+                          iso = 50 + p * 50;
+                          refreshTelemetryHeader();
+                          updateRepeatingPreview();
+                      }
+                      @Override public void onStartTrackingTouch(SeekBar sb) {}
+                      @Override public void onStopTrackingTouch(SeekBar sb) {}
+                  }));
+
+                  deck.addView(buildSliderRow("SHUTTER", 399, 25, new SeekBar.OnSeekBarChangeListener() {
+                      @Override
+                      public void onProgressChanged(SeekBar sb, int p, boolean fromUser) {
+                          shutterDenom = Math.max(2, (p + 1) * 10);
+                          refreshTelemetryHeader();
+                          updateRepeatingPreview();
+                      }
+                      @Override public void onStartTrackingTouch(SeekBar sb) {}
+                      @Override public void onStopTrackingTouch(SeekBar sb) {}
+                  }));
+
+                  deck.addView(buildSliderRow("FOCUS", 714, 0, new SeekBar.OnSeekBarChangeListener() {
+                      @Override
+                      public void onProgressChanged(SeekBar sb, int p, boolean fromUser) {
+                          focusDiopters = p / 100.0f;
+                          refreshTelemetryHeader();
+                          updateRepeatingPreview();
+                      }
+                      @Override public void onStartTrackingTouch(SeekBar sb) {}
+                      @Override public void onStopTrackingTouch(SeekBar sb) {}
+                  }));
+
+                  deck.addView(buildSliderRow("KELVIN", 65, 30, new SeekBar.OnSeekBarChangeListener() {
+                      @Override
+                      public void onProgressChanged(SeekBar sb, int p, boolean fromUser) {
+                          kelvin = 2500 + p * 100;
+                          refreshTelemetryHeader();
+                          updateRepeatingPreview();
+                      }
+                      @Override public void onStartTrackingTouch(SeekBar sb) {}
+                      @Override public void onStopTrackingTouch(SeekBar sb) {}
+                  }));
+
+                  LinearLayout actionRow = new LinearLayout(this);
+                  actionRow.setOrientation(LinearLayout.HORIZONTAL);
+                  actionRow.setGravity(Gravity.CENTER);
+                  actionRow.setPadding(0, dp(6), 0, 0);
+
+                  Button macroLockBtn = new Button(this);
+                  macroLockBtn.setText("14cm MACRO LOCK");
+                  macroLockBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+                  macroLockBtn.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+                          if (!lenses.isEmpty()) selectedLens = lenses.get(lenses.size() - 1);
+                          selectedMode = CaptureMode.TELEMACRO_STACK;
+                          focusDiopters = 7.14f;
+                          refreshTelemetryHeader();
+                          updateSelectionColors();
+                          startCameraSession();
+                      }
+                  });
+                  actionRow.addView(macroLockBtn, new LinearLayout.LayoutParams(0, dp(48), 1f));
+
+                  shutterBtn = new Button(this);
+                  shutterBtn.setText("CAPTURE");
+                  shutterBtn.setBackgroundColor(Color.rgb(255, 193, 7));
+                  shutterBtn.setTextColor(Color.BLACK);
+                  shutterBtn.setTypeface(Typeface.DEFAULT_BOLD);
+                  shutterBtn.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+                          triggerCapture();
+                      }
+                  });
+                  LinearLayout.LayoutParams shParams = new LinearLayout.LayoutParams(dp(110), dp(52));
+                  shParams.leftMargin = dp(8);
+                  shParams.rightMargin = dp(8);
+                  actionRow.addView(shutterBtn, shParams);
+
+                  Button cineLockBtn = new Button(this);
+                  cineLockBtn.setText("180 CINE LOCK");
+                  cineLockBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+                  cineLockBtn.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+                          selectedMode = CaptureMode.VIDEO_10BIT_HLG;
+                          shutterDenom = 120;
+                          iso = 100;
+                          refreshTelemetryHeader();
+                          updateSelectionColors();
+                          startCameraSession();
+                      }
+                  });
+                  actionRow.addView(cineLockBtn, new LinearLayout.LayoutParams(0, dp(48), 1f));
+
+                  deck.addView(actionRow);
+                  root.addView(deck, new LinearLayout.LayoutParams(
+                      ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+                  updateSelectionColors();
+                  return root;
+              }
+
+              private LinearLayout buildSliderRow(String title, int max, int init, SeekBar.OnSeekBarChangeListener listener) {
+                  LinearLayout row = new LinearLayout(this);
+                  row.setOrientation(LinearLayout.HORIZONTAL);
+                  row.setGravity(Gravity.CENTER_VERTICAL);
+                  TextView tv = new TextView(this);
+                  tv.setText(title);
+                  tv.setTextColor(Color.LTGRAY);
+                  tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+                  tv.setTypeface(Typeface.MONOSPACE);
+                  row.addView(tv, new LinearLayout.LayoutParams(dp(64), ViewGroup.LayoutParams.WRAP_CONTENT));
+
+                  SeekBar sb = new SeekBar(this);
+                  sb.setMax(max);
+                  sb.setProgress(init);
+                  sb.setOnSeekBarChangeListener(listener);
+                  row.addView(sb, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+                  return row;
+              }
+
+              private void updateSelectionColors() {
+                  for (int i = 0; i < lensButtons.size() && i < lenses.size(); i++) {
+                      boolean sel = (lenses.get(i) == selectedLens);
+                      lensButtons.get(i).setBackgroundColor(sel ? Color.rgb(255, 193, 7) : Color.rgb(40, 40, 48));
+                      lensButtons.get(i).setTextColor(sel ? Color.BLACK : Color.WHITE);
+                  }
+                  CaptureMode[] modes = CaptureMode.values();
+                  for (int i = 0; i < modeButtons.size() && i < modes.length; i++) {
+                      boolean sel = (modes[i] == selectedMode);
+                      modeButtons.get(i).setBackgroundColor(sel ? Color.rgb(0, 230, 118) : Color.rgb(32, 32, 38));
+                      modeButtons.get(i).setTextColor(sel ? Color.BLACK : Color.LTGRAY);
+                  }
+              }
+
+              private int dp(float v) {
+                  return Math.round(TypedValue.applyDimension(
+                      TypedValue.COMPLEX_UNIT_DIP, v, getResources().getDisplayMetrics()));
+              }
+
+              private void closeCameraSession() {
+                  try {
+                      if (captureSession != null) { captureSession.close(); captureSession = null; }
+                      if (cameraDevice != null) { cameraDevice.close(); cameraDevice = null; }
+                      if (jpegReader != null) { jpegReader.close(); jpegReader = null; }
+                      if (rawReader != null) { rawReader.close(); rawReader = null; }
+                      if (analyzerReader != null) { analyzerReader.close(); analyzerReader = null; }
+                      if (mediaRecorder != null) { mediaRecorder.release(); mediaRecorder = null; }
+                  } catch (Exception ignored) {}
+              }
+
+              @Override
+              protected void onDestroy() {
+                  closeCameraSession();
+                  if (cameraThread != null) cameraThread.quitSafely();
+                  super.onDestroy();
+              }
+          }' > app/src/main/java/com/signaturepro/camera/MainActivity.java
+
+      - name: Upload 3 Core Project Files
+        uses: actions/upload-artifact@v4
+        with:
+          name: SignaturePro-3-Core-Files
+          path: |
+            app/src/main/AndroidManifest.xml
+            app/build.gradle.kts
+            app/src/main/java/com/signaturepro/camera/MainActivity.java
+
+      - name: Compile and Sign SignaturePro APK
+        run: |
+          set -ex
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          ANDROID_JAR=$(find "$SDK/platforms" -name "android.jar" 2>/dev/null | sort -V | tail -n 1)
+          AAPT2=$(find "$SDK/build-tools" -name "aapt2" 2>/dev/null | sort -V | tail -n 1)
+          BUILD_TOOLS=$(dirname "$AAPT2")
+          mkdir -p build/gen build/obj app/build/outputs/apk/debug
+          "$BUILD_TOOLS/aapt2" link -o build/unaligned.apk --manifest app/src/main/AndroidManifest.xml -I "$ANDROID_JAR" --java build/gen
+          javac -source 11 -target 11 -cp "$ANDROID_JAR" -d build/obj app/src/main/java/com/signaturepro/camera/MainActivity.java
+          jar cf build/classes.jar -C build/obj .
+          "$BUILD_TOOLS/d8" --min-api 31 --lib "$ANDROID_JAR" --output build/ build/classes.jar
+          cd build && zip -uj unaligned.apk classes.dex && cd ..
+          "$BUILD_TOOLS/zipalign" -f -p 4 build/unaligned.apk build/aligned.apk
+          keytool -genkeypair -v -keystore build/debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=SignaturePro,O=Motorola,C=US"
+          "$BUILD_TOOLS/apksigner" sign --ks build/debug.keystore --ks-pass pass:android --key-pass pass:android --out app/build/outputs/apk/debug/SignaturePro-Motorola.apk build/aligned.apk
+
+      - name: Upload Installable SignaturePro APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SignaturePro-Motorola-APK
+          path: app/build/outputs/apk/debug/SignaturePro-Motorola.apk
