@@ -1,1 +1,421 @@
+name: Build SignaturePro APK
 
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Auto-Generate All Project Files on Server
+        run: |
+          mkdir -p app/src/main/java/com/signaturepro/camera
+
+          cat << 'EOF' > settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "SignaturePro"
+          include(":app")
+          EOF
+
+          cat << 'EOF' > build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.7.0" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.25" apply false
+          }
+          EOF
+
+          cat << 'EOF' > gradle.properties
+          org.gradle.jvmargs=-Xmx4096m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          EOF
+
+          cat << 'EOF' > app/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.signaturepro.camera"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.signaturepro.camera"
+                  minSdk = 31
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0.0-SignaturePro"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+              buildFeatures {
+                  compose = true
+              }
+              composeOptions {
+                  kotlinCompilerExtensionVersion = "1.5.15"
+              }
+          }
+
+          dependencies {
+              val composeBom = platform("androidx.compose:compose-bom:2024.09.00")
+              implementation(composeBom)
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
+              implementation("androidx.activity:activity-compose:1.9.2")
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.ui:ui-graphics")
+              implementation("androidx.compose.material3:material3")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              package="com.signaturepro.camera">
+
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+
+              <uses-feature android:name="android.hardware.camera" android:required="true" />
+              <uses-feature android:name="android.hardware.camera.raw" android:required="false" />
+              <uses-feature android:name="android.hardware.camera.capability.manual_sensor" android:required="false" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="SignaturePro Cam"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/signaturepro/camera/MainActivity.kt
+          package com.signaturepro.camera
+
+          import android.Manifest
+          import android.annotation.SuppressLint
+          import android.content.ContentValues
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.graphics.ImageFormat
+          import android.graphics.Rect
+          import android.graphics.SurfaceTexture
+          import android.hardware.camera2.*
+          import android.hardware.camera2.params.DynamicRangeProfiles
+          import android.hardware.camera2.params.OutputConfiguration
+          import android.hardware.camera2.params.RggbChannelVector
+          import android.hardware.camera2.params.SessionConfiguration
+          import android.media.Image
+          import android.media.ImageReader
+          import android.media.MediaRecorder
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Environment
+          import android.os.Handler
+          import android.os.HandlerThread
+          import android.provider.MediaStore
+          import android.util.Size
+          import android.view.HapticFeedbackConstants
+          import android.view.Surface
+          import android.view.TextureView
+          import android.widget.Toast
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.Canvas
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.geometry.Offset
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.platform.LocalView
+          import androidx.compose.ui.text.font.FontFamily
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.compose.ui.viewinterop.AndroidView
+          import androidx.core.content.ContextCompat
+          import kotlinx.coroutines.CoroutineScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import java.io.File
+          import java.nio.ByteBuffer
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          import java.util.concurrent.Executor
+          import java.util.concurrent.Executors
+          import kotlin.math.abs
+          import kotlin.math.roundToInt
+
+          data class PhysicalLensProfile(
+              val logicalId: String,
+              val physicalId: String?,
+              val label: String,
+              val focalLengthMm: Float,
+              val aperture: Float,
+              val minFocusDiopters: Float,
+              val isLossless2xCrop: Boolean = false,
+              val supportsRaw: Boolean = false,
+              val supportsUltraHighRes50MP: Boolean = false,
+              val supports10BitHlg: Boolean = false,
+              val activeArrayRect: Rect = Rect(0, 0, 4096, 3072),
+              val maxRawSize: Size? = null,
+              val maxJpegSize: Size = Size(4096, 3072)
+          )
+
+          enum class CaptureMode(val title: String) {
+              PRO_RAW_16("16-BIT RAW + JPEG"),
+              REMOSAIC_50MP("50MP FULL REMOSAIC"),
+              TELEMACRO_STACK("14CM FOCUS STACK (10x)"),
+              VIDEO_10BIT_HLG("4K 10-BIT HLG VIDEO")
+          }
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent {
+                      MaterialTheme(colorScheme = darkColorScheme()) {
+                          val context = LocalContext.current
+                          var hasPermissions by remember {
+                              mutableStateOf(
+                                  ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED &&
+                                  ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+                              )
+                          }
+
+                          val launcher = rememberLauncherForActivityResult(
+                              ActivityResultContracts.RequestMultiplePermissions()
+                          ) { perms ->
+                              hasPermissions = perms[Manifest.permission.CAMERA] == true &&
+                                      perms[Manifest.permission.RECORD_AUDIO] == true
+                          }
+
+                          LaunchedEffect(Unit) {
+                              if (!hasPermissions) {
+                                  launcher.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO))
+                              }
+                          }
+
+                          Surface(modifier = Modifier.fillMaxSize(), color = Color.Black) {
+                              if (hasPermissions) {
+                                  SignatureProCameraScreen()
+                              } else {
+                                  Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                      Button(onClick = {
+                                          launcher.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO))
+                                      }) {
+                                          Text("Grant Camera & Mic Permissions for SignaturePro")
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          class SignatureCameraEngine(private val context: Context) {
+              private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+              private val cameraThread = HandlerThread("SignatureCameraThread").apply { start() }
+              private val cameraHandler = Handler(cameraThread.looper)
+              private val cameraExecutor: Executor = Executors.newSingleThreadExecutor()
+              private val ioScope = CoroutineScope(Dispatchers.IO)
+
+              private var cameraDevice: CameraDevice? = null
+              private var captureSession: CameraCaptureSession? = null
+              private var activeCharacteristics: CameraCharacteristics? = null
+
+              private var jpegReader: ImageReader? = null
+              private var rawReader: ImageReader? = null
+              private var analyzerReader: ImageReader? = null
+              private var mediaRecorder: MediaRecorder? = null
+              private var pendingVideoFile: File? = null
+
+              var isRecordingVideo by mutableStateOf(false)
+              var statusBanner by mutableStateOf("Initializing Motorola Signature Hardware...")
+
+              var histogramBins by mutableStateOf(FloatArray(64) { 0f })
+              var overlayPoints by mutableStateOf<List<Pair<Float, Float>>>(emptyList())
+              var zebraPoints by mutableStateOf<List<Pair<Float, Float>>>(emptyList())
+
+              private val burstBitmaps = mutableListOf<Bitmap>()
+              private var expectedBurstCount = 0
+
+              fun enumerateSignatureLenses(): List<PhysicalLensProfile> {
+                  val profiles = mutableListOf<PhysicalLensProfile>()
+                  try {
+                      for (logicalId in cameraManager.cameraIdList) {
+                          val chars = cameraManager.getCameraCharacteristics(logicalId)
+                          if (chars.get(CameraCharacteristics.LENS_FACING) != CameraMetadata.LENS_FACING_BACK) continue
+
+                          val caps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: intArrayOf()
+                          val isLogicalMulti = caps.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA)
+                          val physIds = if (isLogicalMulti) chars.physicalCameraIds.ifEmpty { setOf(logicalId) } else setOf(logicalId)
+
+                          for (physId in physIds) {
+                              val pChars = cameraManager.getCameraCharacteristics(physId)
+                              val focal = pChars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: 4.5f
+                              val aperture = pChars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES)?.firstOrNull() ?: 1.8f
+                              val minFocus = pChars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
+                              val pCaps = pChars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: intArrayOf()
+                              val supportsRaw = pCaps.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_RAW)
+                              val supports50Mp = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                                  pCaps.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_ULTRA_HIGH_RESOLUTION_SENSOR)
+                              } else false
+                              val supports10Bit = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                  pCaps.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_DYNAMIC_RANGE_TEN_BIT)
+                              } else false
+
+                              val activeRect = pChars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: Rect(0, 0, 4096, 3072)
+                              val map = if (supports50Mp && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                                  pChars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION)
+                                      ?: pChars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                              } else {
+                                  pChars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                              }
+
+                              val maxRaw = if (supportsRaw) {
+                                  map?.getOutputSizes(ImageFormat.RAW_SENSOR)?.maxByOrNull { it.width.toLong() * it.height.toLong() }
+                              } else null
+                              val maxJpeg = map?.getOutputSizes(ImageFormat.JPEG)?.maxByOrNull { it.width.toLong() * it.height.toLong() }
+                                  ?: Size(4096, 3072)
+
+                              val label = when {
+                                  focal < 2.8f -> "12mm JNS (0.5x)"
+                                  focal in 2.8f..6.0f -> "24mm LYT-828 (1x)"
+                                  else -> "71mm LYT-600 (3x Macro)"
+                              }
+
+                              val profile = PhysicalLensProfile(
+                                  logicalId = logicalId,
+                                  physicalId = if (physId != logicalId) physId else null,
+                                  label = label,
+                                  focalLengthMm = focal,
+                                  aperture = aperture,
+                                  minFocusDiopters = minFocus,
+                                  supportsRaw = supportsRaw,
+                                  supportsUltraHighRes50MP = supports50Mp,
+                                  supports10BitHlg = supports10Bit,
+                                  activeArrayRect = activeRect,
+                                  maxRawSize = maxRaw,
+                                  maxJpegSize = maxJpeg
+                              )
+                              profiles.add(profile)
+
+                              if (focal in 2.8f..6.0f) {
+                                  profiles.add(
+                                      profile.copy(
+                                          label = "48mm Lossless (2x)",
+                                          isLossless2xCrop = true
+                                      )
+                                  )
+                              }
+                          }
+                          break
+                      }
+                  } catch (e: Exception) {
+                      statusBanner = "Enum Error: ${e.localizedMessage}"
+                  }
+
+                  if (profiles.isEmpty()) {
+                      val fallbackId = cameraManager.cameraIdList.firstOrNull() ?: "0"
+                      profiles.add(
+                          PhysicalLensProfile(
+                              logicalId = fallbackId,
+                              physicalId = null,
+                              label = "24mm Main (1x)",
+                              focalLengthMm = 4.7f,
+                              aperture = 1.6f,
+                              minFocusDiopters = 7.14f,
+                              supportsRaw = true
+                          )
+                      )
+                  }
+                  return profiles.sortedBy { if (it.isLossless2xCrop) it.focalLengthMm * 1.5f else it.focalLengthMm }
+              }
+
+              @SuppressLint("MissingPermission")
+              fun startSession(
+                  lens: PhysicalLensProfile,
+                  mode: CaptureMode,
+                  surfaceTexture: SurfaceTexture,
+                  iso: Int,
+                  shutterNs: Long,
+                  focusDiopters: Float,
+                  kelvin: Int,
+                  enablePeaking: Boolean,
+                  enableZebras: Boolean
+              ) {
+                  closeSession()
+                  val targetCharId = lens.physicalId ?: lens.logicalId
+                  activeCharacteristics = cameraManager.getCameraCharacteristics(targetCharId)
+
+                  cameraManager.openCamera(lens.logicalId, object : CameraDevice.StateCallback() {
+                      override fun onOpened(device: CameraDevice) {
+                          cameraDevice = device
+                          buildStreamsAndSession(
+                              device, lens, mode
